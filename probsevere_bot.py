@@ -16,17 +16,17 @@ STATE_FILE = "probsevere_state.json"
 WEBHOOK_URL = os.environ.get("PROBSEVERE_WEBHOOK_URL", "YOUR_DISCORD_WEBHOOK_URL_HERE")
 ROLE_ID = "1485401778962043021"
 
-HOME_LAT = 44.0778
-HOME_LON = -96.1487
+HOME_LAT = 43.4806
+HOME_LON = -88.2250
 HOME_POINT = Point(HOME_LON, HOME_LAT)
 
 ALERT_BOX = HOME_POINT.buffer(0.072)
 
 HOURS_TO_PROJECT = 1
 
-THRESHOLD_TOR = 0
-THRESHOLD_WIND = 0
-THRESHOLD_HAIL = 0
+THRESHOLD_TOR = 2
+THRESHOLD_WIND = 5
+THRESHOLD_HAIL = 5
 
 def get_latest_probsevere_url():
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -139,8 +139,16 @@ def build_discord_embed(props, impact_text):
     if prob_tor >= THRESHOLD_TOR:
         llaz = float(props.get("P98LLAZ", 0))
         mlaz = float(props.get("P98MLAZ", 0))
+        mlat = float(props.get("MLAT", 0))
+        mlon = float(props.get("MLON", 0))
+
         val = f"`Low-Level Rotation:` {get_rotation_class(llaz)} ({llaz} /s)\n"
         val += f"`Mid-Level Rotation:` {get_rotation_class(mlaz)} ({mlaz} /s)"
+
+        # Add the exact TVS coordinate to Discord if one is tracked!
+        if mlat != 0 and mlon != 0:
+            val += f"\n`TVS Location:` {mlat:.4f}, {mlon:.4f}"
+
         embed["fields"].append({"name": f"🌪️ TORNADO THREAT: {prob_tor}%", "value": val, "inline": False})
     elif prob_tor >= 5:
         minor_threats.append(f"{prob_tor}% chance of a tornado")
