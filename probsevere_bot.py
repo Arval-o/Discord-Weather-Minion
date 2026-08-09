@@ -7,264 +7,227 @@ import time
 from datetime import datetime, timedelta
 from shapely.geometry import Point, shape, MultiPolygon
 from shapely.affinity import translate
+from shapely.ops import nearest_points
 from radar_generator import generate_radar_image
 
 # config
 BASE_URL = "https://mrms.ncep.noaa.gov/ProbSevere/PROBSEVERE/"
 STATE_FILE = "probsevere_state.json"
-
 WEBHOOK_URL = os.environ.get("PROBSEVERE_WEBHOOK_URL", "YOUR_DISCORD_WEBHOOK_URL_HERE")
 ROLE_ID = "1485401778962043021"
 
-HOME_LAT = 43.4806
-HOME_LON = -88.2250
+HOME_LAT = 44.0778
+HOME_LON = -96.1487
 HOME_POINT = Point(HOME_LON, HOME_LAT)
-
 ALERT_BOX = HOME_POINT.buffer(0.072)
-
 HOURS_TO_PROJECT = 1
 
-THRESHOLD_TOR = 2
-THRESHOLD_WIND = 5
-THRESHOLD_HAIL = 5
+THRESHOLD_TOR = 0
+THRESHOLD_WIND = 0
+THRESHOLD_HAIL = 0
+
+def safe_float(val):
+    try: return float(val)
+    except (ValueError, TypeError): return 0.0
+
+def get_compass_dir(motion_e, motion_s):
+    if motion_e == 0 and motion_s == 0: return "Stationary"
+    angle = math.degrees(math.atan2(-motion_s, motion_e))
+    if angle < 0: angle += 360
+    dirs = ["East", "East-Northeast", "Northeast", "North-Northeast", "North", "North-Northwest", "Northwest", "West-Northwest", "West", "West-Southwest", "Southwest", "South-Southwest", "South", "South-Southeast", "Southeast","East-Southeast", "East"]
+    return dirs[int(round((angle / 360.0) * 16)) % 16] 
+
+def haversine_distance(p1, p2):
+    lon1, lat1, lon2, lat2 = p1.x, p1.y, p2.x, p2.y
+    dlat, dlon = math.radians(lat2 - lat1), math.radians(lon2 - lon1)
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
+    return 3958.8 * (2 * math.atan2(math.sqrt(a), math.sqrt(1-a)))
 
 def get_latest_probsevere_url():
-    headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        r = requests.get(BASE_URL, headers=headers, timeout=10)
-        r.raise_for_status()
+        r = requests.get(BASE_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
         filenames = re.findall(r'href="(MRMS_PROBSEVERE_\d+_\d+\.json)"', r.text)
-        if not filenames:
-            return None
-        return BASE_URL + filenames[-1]
-    except Exception as e:
-        print(f"Error finding latest data: {e}")
-        return None
-
-def fetch_probsevere(url):
-    print(f"[{(datetime.utcnow() - timedelta(hours=4)).strftime('%I:%M %p')}] Downloading: {url}")
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        r = requests.get(url, headers=headers, timeout=15)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        print(f"Error downloading data: {e}")
-        return None
+        return BASE_URL + filenames[-1] if filenames else None
+    except: return None
 
 def post_to_discord(payload, message_id=None, file_path=None):
-    if WEBHOOK_URL == "YOUR_DISCORD_WEBHOOK_URL_HERE":
-        print("Webhook URL not set!")
-        return None
+    if WEBHOOK_URL == "YOUR_DISCORD_WEBHOOK_URL_HERE": return None
 
+    f = None
     files = None
     if file_path and os.path.exists(file_path):
-        files = {"file": ("radar.png", open(file_path, "rb"), "image/png")}
+        f = open(file_path, "rb")
+        files = {"files[0]": ("radar.png", f, "image/png")}
         payload["embeds"][0]["image"] = {"url": "attachment://radar.png"}
+        payload["attachments"] = [{"id": 0, "filename": "radar.png"}]
 
     try:
         if message_id:
-            update_url = f"{WEBHOOK_URL}/messages/{message_id}"
-            if files:
-                # ONLY inject the attachments override when updating to prevent gallery buildup!
-                payload["attachments"] = []
-                r = requests.patch(update_url, files=files, data={"payload_json": json.dumps(payload)})
-            else:
-                r = requests.patch(update_url, json=payload)
-            r.raise_for_status()
+            r = requests.patch(f"{WEBHOOK_URL}/messages/{message_id}", files=files, data={"payload_json": json.dumps(payload)})
+            if r.status_code == 429:
+                time.sleep(float(r.headers.get("Retry-After", 1.0)))
+                if f: f.seek(0) # CRITICAL FIX: Rewinds file pointer after failed upload attempt
+                requests.patch(f"{WEBHOOK_URL}/messages/{message_id}", files=files, data={"payload_json": json.dumps(payload)})
             return message_id
         else:
-            url = WEBHOOK_URL + "?wait=true"
-            if files:
-                r = requests.post(url, files=files, data={"payload_json": json.dumps(payload)})
-            else:
-                r = requests.post(url, json=payload)
-            r.raise_for_status()
+            r = requests.post(WEBHOOK_URL + "?wait=true", files=files, data={"payload_json": json.dumps(payload)})
+            if r.status_code == 429:
+                time.sleep(float(r.headers.get("Retry-After", 1.0)))
+                if f: f.seek(0)
+                r = requests.post(WEBHOOK_URL + "?wait=true", files=files, data={"payload_json": json.dumps(payload)})
             return r.json().get("id")
-    except Exception as e:
-        print(f"Error posting to Discord: {e}")
-        return None
+    except: return None
+    finally:
+        if f: f.close() # CRITICAL FIX: Closes file handle to prevent memory leaks
 
 def load_state():
     try:
-        with open(STATE_FILE, "r") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {"alerted_storms": {}}
+        with open(STATE_FILE, "r") as f: return json.load(f)
+    except: return {"alerted_storms": {}}
 
 def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f)
+    with open(STATE_FILE, "w") as f: json.dump(state, f)
 
-def get_rotation_class(az_shear):
-    if az_shear >= 0.015: return "🔴 EXTREME"
-    elif az_shear >= 0.010: return "🟠 STRONG"
-    elif az_shear >= 0.005: return "🟡 MODERATE"
-    else: return "🔵 WEAK"
+def estimate_tornado_winds(maxllaz):
+    base_wind = (maxllaz * 2000.0 * 2.23694) * 1.6
+    if base_wind < 50: return 0, 0
+    return int(base_wind * 0.85), int(base_wind * 1.15)
 
-def build_discord_embed(props, impact_text):
-    prob_severe = int(props.get("ProbSevere", 0))
-    prob_tor = int(props.get("ProbTor", 0))
-    prob_wind = int(props.get("ProbWind", 0))
-    prob_hail = int(props.get("ProbHail", 0))
-    motion_e = float(props.get("MOTION_EAST", 0))
-    motion_s = float(props.get("MOTION_SOUTH", 0))
+def estimate_straight_line_winds(dcape, mean_wind_kts):
+    total_gust = (math.sqrt(2 * max(0, dcape)) * 2.23694 * 0.6) + (mean_wind_kts * 1.15078 * 0.4)
+    if total_gust < 30: return 0, 0
+    return int(total_gust * 0.85), int(total_gust * 1.15)
 
-    speed_knots = math.sqrt(motion_e**2 + motion_s**2)
-    speed_mph = int(speed_knots * 1.15078)
+def get_hail_object(mesh_inches):
+    sizes = [(0.5, "Pea"), (0.75, "Marble"), (0.88, "Dime"), (1.0, "Quarter"), (1.25, "Half Dollar"), (1.5, "Ping Pong Ball"), (1.75, "Golf Ball"), (2.0, "Hen Egg"), (2.5, "Tennis Ball"), (2.75, "Baseball"), (3.0, "Teacup"), (4.0, "Grapefruit")]
+    for limit, name in sizes:
+        if mesh_inches < limit: return name
+    return "Softball"
 
-    if prob_severe >= 70:
-        title = "SEVERE STORM APPROACHING AREA"
-    else:
-        title = "POSSIBLE SEVERE STORM APPROACHING AREA"
-
-    color = 0x808080
-    if prob_tor >= THRESHOLD_TOR: color = 0xFF0000
-    elif prob_wind >= THRESHOLD_WIND and prob_hail >= THRESHOLD_HAIL: color = 0xFFA500
-    elif prob_hail >= THRESHOLD_HAIL: color = 0x00FF00
-    elif prob_wind >= THRESHOLD_WIND: color = 0x0000FF
+def build_discord_embed(props, impact_text, storm_id):
+    prob_tor, prob_wind, prob_hail = int(props.get("ProbTor", 0)), int(props.get("ProbWind", 0)), int(props.get("ProbHail", 0))
+    speed_mph = int(math.sqrt(safe_float(props.get("MOTION_EAST", 0))**2 + safe_float(props.get("MOTION_SOUTH", 0))**2) * 1.15078)
+    color = 0xFF0000 if prob_tor >= THRESHOLD_TOR else (0x00FF00 if prob_hail >= THRESHOLD_HAIL else 0x0000FF)
 
     embed = {
-        "title": title,
-        "description": "*Live tracking, updates every ~2 minutes.*\n\n"
-                       f"**Impact Window:** {impact_text}\n"
-                       f"**Storm Motion:** {speed_mph} mph",
-        "color": color,
-        "fields": [],
-        "footer": {"text": f"Last updated: {(datetime.utcnow() - timedelta(hours=4)).strftime('%I:%M %p EST')}"}
+        "author": {"name": f"🔴 LIVE TELEMETRY: STORM OBJECT {storm_id}"},
+        "description": f"**Storm ID:** `{storm_id}`\n"
+                       f"**Threat Status:** {'🚨 **CRITICAL**' if int(props.get('ProbSevere', 0)) >= 70 else '⚠️ **ELEVATED**'}\n"
+                       f"**Impact ETA:** {impact_text}\n"
+                       f"**Storm Velocity:** {speed_mph} mph\n"
+                       f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "color": color, "fields": [], "footer": {"text": "NCEP MRMS Live Pipeline"}
     }
 
-    minor_threats = []
-
     if prob_tor >= THRESHOLD_TOR:
-        llaz = float(props.get("P98LLAZ", 0))
-        mlaz = float(props.get("P98MLAZ", 0))
-        mlat = float(props.get("MLAT", 0))
-        mlon = float(props.get("MLON", 0))
-
-        val = f"`Low-Level Rotation:` {get_rotation_class(llaz)} ({llaz} /s)\n"
-        val += f"`Mid-Level Rotation:` {get_rotation_class(mlaz)} ({mlaz} /s)"
-
-        # Add the exact TVS coordinate to Discord if one is tracked!
-        if mlat != 0 and mlon != 0:
-            val += f"\n`TVS Location:` {mlat:.4f}, {mlon:.4f}"
-
+        llaz = safe_float(props.get("MAXLLAZ", 0))
+        val = f"`Low-Level Rotation:` {llaz:.4f} /s\n`Effective Bulk Shear:` {safe_float(props.get('EBSHEAR', 0))} kts\n\n"
+        low_t, high_t = estimate_tornado_winds(llaz)
+        if prob_tor >= 40 and low_t >= 70: val += f"**🌪️ EST. TORNADO WINDS: {low_t} - {high_t} mph**\n"
+        mlat, mlon = safe_float(props.get("MLAT", 0)), safe_float(props.get("MLON", 0))
+        if mlat != 0 and mlon != 0 and prob_tor >= 40: val += f"`TVS Coordinates:` {mlat:.4f}, {mlon:.4f}"
         embed["fields"].append({"name": f"🌪️ TORNADO THREAT: {prob_tor}%", "value": val, "inline": False})
-    elif prob_tor >= 5:
-        minor_threats.append(f"{prob_tor}% chance of a tornado")
-
-    if prob_hail >= THRESHOLD_HAIL:
-        mesh = props.get("MESH", "0")
-        vil = props.get("VIL", "0")
-        val = f"`Max Expected Size:` {mesh} inches\n`VIL Core:` {vil} kg/m²"
-        embed["fields"].append({"name": f"🧊 HAIL THREAT: {prob_hail}%", "value": val, "inline": False})
-    elif prob_hail >=10:
-        minor_threats.append(f"{prob_hail}% chance of severe hail")
 
     if prob_wind >= THRESHOLD_WIND:
-        dcape = props.get("DCAPE", "0")
-        val = f"`Downdraft Potential (DCAPE):` {dcape} J/kg"
+        dcape, mean_wind = safe_float(props.get("DCAPE", 0)), safe_float(props.get("MEANWIND_1-3kmAGL", 0))
+        val = f"`DCAPE:` {dcape} J/kg\n\n"
+        low_w, high_w = estimate_straight_line_winds(dcape, mean_wind)
+        if low_w >= 45: val += f"**💨 EST. SURFACE GUSTS: {low_w} - {high_w} mph**"
         embed["fields"].append({"name": f"💨 WIND THREAT: {prob_wind}%", "value": val, "inline": False})
-    elif prob_wind >=15:
-        minor_threats.append(f"{prob_wind}% chance of severe wind")
 
-    lightning = props.get("FLASH_RATE", "0")
-    minor_text = ""
-    if minor_threats:
-        minor_text = f"\n*Minor Threats: This storm also has a " + " and a ".join(minor_threats) + ".*"
-
-    embed["fields"].append({
-        "name": "⚡ Live Storm Vitality",
-        "value": f"`Lightning:` {lightning} flashes/min{minor_text}",
-        "inline": False
-    })
+    if prob_hail >= THRESHOLD_HAIL:
+        mesh = safe_float(props.get("MESH", 0))
+        val = f"`Max Expected Size:` **{mesh}\"** *(Size of a {get_hail_object(mesh)})*\n\n`VIL (Core Mass):` {safe_float(props.get('VIL', 0))} kg/m²"
+        embed["fields"].append({"name": f"🧊 HAIL THREAT: {prob_hail}%", "value": val, "inline": False})
 
     return embed
 
 def process_storms(data):
     features = data.get("features", [])
-    print(f"Tracking {len(features)} storm objects nationwide...")
-
     state = load_state()
     current_time = time.time()
 
-    state["alerted_storms"] = {k: v for k, v in state["alerted_storms"].items()
-                               if current_time - v.get("timestamp", 0) < 7200}
+    current_threatening_ids = set()
+    all_mrms_storms = {}
 
     for storm in features:
         props = storm.get("properties", {})
         storm_id = str(props.get("ID", "Unknown"))
+        all_mrms_storms[storm_id] = storm
 
         try:
-            prob_tor = int(props.get("ProbTor", 0))
-            prob_wind = int(props.get("ProbWind", 0))
-            prob_hail = int(props.get("ProbHail", 0))
-            motion_e = float(props.get("MOTION_EAST", 0))
-            motion_s = float(props.get("MOTION_SOUTH", 0))
-        except ValueError:
-            continue
+            prob_tor, prob_wind, prob_hail = int(props.get("ProbTor", 0)), int(props.get("ProbWind", 0)), int(props.get("ProbHail", 0))
+            motion_e, motion_s = float(props.get("MOTION_EAST", 0)), float(props.get("MOTION_SOUTH", 0))
+        except ValueError: continue
 
         if prob_tor >= THRESHOLD_TOR or prob_wind >= THRESHOLD_WIND or prob_hail >= THRESHOLD_HAIL:
-
             geom = storm.get("geometry", {})
-            if not geom or geom.get("type") != "Polygon":
-                continue
+            if not geom or 'Polygon' not in geom.get("type"): continue
+
+            if geom['type'] == 'Polygon': exterior = geom['coordinates'][0]
+            else: exterior = geom['coordinates'][0][0]
 
             current_footprint = shape(geom)
-            current_center = current_footprint.centroid
-
-            speed_deg_per_hour = math.sqrt(motion_e**2 + motion_s**2) / 60.0
-            speed_deg_per_min = speed_deg_per_hour / 60.0
+            speed_mph = math.sqrt(motion_e**2 + motion_s**2) * 1.15078
 
             delta_lat = -(motion_s / 60.0) * HOURS_TO_PROJECT
-            lat_radians = math.radians(current_center.y)
-            delta_lon = ((motion_e / 60.0) / math.cos(lat_radians)) * HOURS_TO_PROJECT
+            delta_lon = ((motion_e / 60.0) / math.cos(math.radians(current_footprint.centroid.y))) * HOURS_TO_PROJECT
+            swept_swath = MultiPolygon([current_footprint, translate(current_footprint, xoff=delta_lon, yoff=delta_lat)]).convex_hull
 
-            future_footprint = translate(current_footprint, xoff=delta_lon, yoff=delta_lat)
-            swept_swath = MultiPolygon([current_footprint, future_footprint]).convex_hull
-            final_threat_area = swept_swath.buffer(0.05)
-
-            if final_threat_area.intersects(ALERT_BOX):
-
-                if speed_deg_per_min > 0:
-                    dist_to_entry = current_footprint.distance(ALERT_BOX)
-                    eta_mins = int(dist_to_entry / speed_deg_per_min)
-
-                    if eta_mins == 0:
-                        impact_text = "Currently impacting area"
-                    else:
-                        impact_text = f"Entering area in ~{eta_mins} minutes"
+            if swept_swath.buffer(0.05).intersects(ALERT_BOX):
+                current_threatening_ids.add(storm_id)
+                if current_footprint.intersects(ALERT_BOX):
+                    eta_mins = 0
+                    impact_text = "Currently impacting area"
                 else:
-                    impact_text = "Unknown (stationary)"
+                    p1, p2 = nearest_points(current_footprint, ALERT_BOX)
+                    dist_miles = haversine_distance(p1, p2)
+                    eta_mins = int(dist_miles / (speed_mph / 60.0)) if speed_mph > 0 else 0
+                    impact_text = f"Entering area in ~{eta_mins} minutes"
 
-                previous_alert = state["alerted_storms"].get(storm_id)
-                msg_id = previous_alert.get("message_id") if previous_alert else None
-
-                embed = build_discord_embed(props, impact_text)
-                payload = {"content": f"<@&{ROLE_ID}>", "embeds": [embed]}
-
-                # Generate radar matrix
-                print(f"Generating 2x2 Radar Matrix for Storm {storm_id}...")
+                msg_id = state["alerted_storms"].get(storm_id, {}).get("message_id")
+                payload = {"content": f"<@&{ROLE_ID}>", "embeds": [build_discord_embed(props, impact_text, storm_id)]}
                 image_path = generate_radar_image(props, geom, "radar.png")
 
-                if msg_id:
-                    print(f"Updating existing alert for Storm {storm_id}")
-                    post_to_discord(payload, message_id=msg_id, file_path=image_path)
+                new_msg_id = post_to_discord(payload, message_id=msg_id, file_path=image_path)
+                if new_msg_id:
+                    state["alerted_storms"][storm_id] = {"timestamp": current_time, "message_id": new_msg_id, "eta_mins": eta_mins, "status": "active"}
+
+    # --- RESOLUTION / STOP-TRACKING SYSTEM ---
+    for storm_id, data in list(state["alerted_storms"].items()):
+        if data.get("status") == "active" and storm_id not in current_threatening_ids:
+            msg_id = data["message_id"]
+            eta_mins = data.get("eta_mins", 0)
+            arrival_time = (datetime.utcnow() - timedelta(hours=4) + timedelta(minutes=eta_mins)).strftime('%I:%M %p')
+
+            if storm_id in all_mrms_storms:
+                props = all_mrms_storms[storm_id].get("properties", {})
+                motion_e, motion_s = safe_float(props.get("MOTION_EAST", 0)), safe_float(props.get("MOTION_SOUTH", 0))
+                prob_severe = int(props.get("ProbSevere", 0))
+
+                # If it's still generally severe but its cone missed the box, it deviated!
+                if prob_severe > 30:
+                    dir_str = get_compass_dir(motion_e, motion_s)
+                    resolve_text = f"**Storm ID:** `{storm_id}`\n\n✅ This storm is no longer on track to hit the area. It has deviated and is currently moving {dir_str}."
                 else:
-                    print(f"🚨 NEW ALERT for Storm {storm_id}")
-                    msg_id = post_to_discord(payload, file_path=image_path)
+                    resolve_text = f"**Storm ID:** `{storm_id}`\n\n✅ This storm no longer has a very high chance of being severe. Simply expect some rain and thunder at around {arrival_time}."
+            else:
+                resolve_text = f"**Storm ID:** `{storm_id}`\n\n✅ This storm no longer has a very high chance of being severe. Simply expect some rain and thunder at around {arrival_time}."
 
-                state["alerted_storms"][storm_id] = {
-                    "timestamp": current_time,
-                    "message_id": msg_id
-                }
+            payload = {
+                "content": "", # Remove ping so it doesn't bother users
+                "embeds": [{"title": f"STORM {storm_id} TRACKING CONCLUDED", "description": resolve_text, "color": 0x555555}],
+                "attachments": [] # Force Discord to physically delete the radar image to clean up the channel
+            }
+            post_to_discord(payload, message_id=msg_id)
+            state["alerted_storms"][storm_id]["status"] = "resolved"
 
+    state["alerted_storms"] = {k: v for k, v in state["alerted_storms"].items() if current_time - v.get("timestamp", 0) < 14400}
     save_state(state)
 
 def bot_loop():
-    print("Starting Continuous ProbSevere Loop...")
+    print("Starting Live MRMS Pipeline...")
     last_processed_url = None
-
     while True:
         try:
             url = get_latest_probsevere_url()
@@ -273,12 +236,8 @@ def bot_loop():
                 if data:
                     process_storms(data)
                     last_processed_url = url
-            else:
-                print(f"[{(datetime.utcnow() - timedelta(hours=4)).strftime('%I:%M %p')}] No new update yet. Waiting...")
-        except Exception as e:
-            print(f"Error in main loop: {e}")
-
-        time.sleep(60)
+            else: time.sleep(60)
+        except Exception as e: print(f"Error in loop: {e}")
 
 if __name__ == "__main__":
     bot_loop()
