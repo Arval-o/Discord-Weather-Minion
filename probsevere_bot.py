@@ -191,7 +191,7 @@ def process_storms(data):
 
                 new_msg_id = post_to_discord(payload, message_id=msg_id, file_path=image_path)
                 if new_msg_id:
-                    state["alerted_storms"][storm_id] = {"timestamp": current_time, "message_id": new_msg_id, "eta_mins": eta_mins, "status": "active"}
+                    state["alerted_storms"][storm_id] = {"timestamp": current_time, "message_id": new_msg_id, "eta_mins": eta_mins, "status": "active", "polygon": list(current_footprint.exterior.coords)}
 
     # --- RESOLUTION / STOP-TRACKING SYSTEM ---
     for storm_id, data in list(state["alerted_storms"].items()):
