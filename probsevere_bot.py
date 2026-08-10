@@ -257,8 +257,9 @@ def bot_loop():
         try:
             url = get_latest_probsevere_url()
             if url and url != last_processed_url:
-                data = fetch_probsevere(url)  # Ensure you define fetch_probsevere in your environment or use requests.get
-                if data:
+                r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+                if r.status_code == 200:
+                    data = r.json()
                     process_storms(data)
                     last_processed_url = url
             else: time.sleep(60)
