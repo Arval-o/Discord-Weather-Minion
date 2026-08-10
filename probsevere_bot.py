@@ -188,7 +188,6 @@ def process_storms(data):
 
                 msg_id = state["alerted_storms"].get(storm_id, {}).get("message_id")
 
-                # Ensure we don't accidentally overwrite our Warnings Bot Piggyback Embeds!
                 payload = {"embeds": [build_discord_embed(props, impact_text, storm_id)]}
 
                 if msg_id:
@@ -219,7 +218,6 @@ def process_storms(data):
                         "polygon": list(current_footprint.exterior.coords)
                     }
 
-    # --- RESOLUTION / STOP-TRACKING SYSTEM ---
     for storm_id, data in list(state["alerted_storms"].items()):
         if data.get("status") == "active" and storm_id not in current_threatening_ids:
             msg_id = data["message_id"]
