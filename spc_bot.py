@@ -297,3 +297,6 @@ def main():
         requests.post(f"{WEBHOOK_URL}?wait=true", json={"content": content, "embeds": embeds}, timeout=30)
 
     save_state(state)
+
+if __name__ == "__main__":
+    main()
