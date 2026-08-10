@@ -16,10 +16,10 @@ STATE_FILE = "probsevere_state.json"
 WEBHOOK_URL = os.environ.get("PROBSEVERE_WEBHOOK_URL", "YOUR_DISCORD_WEBHOOK_URL_HERE")
 ROLE_ID = "1485401778962043021"
 
-HOME_LAT = 44.0778
-HOME_LON = -96.1487
+HOME_LAT = 40.6035
+HOME_LON = -80.0536
 HOME_POINT = Point(HOME_LON, HOME_LAT)
-ALERT_BOX = HOME_POINT.buffer(0.072)
+ALERT_BOX = HOME_POINT.buffer(0.06)
 HOURS_TO_PROJECT = 1
 
 THRESHOLD_TOR = 0
@@ -34,8 +34,8 @@ def get_compass_dir(motion_e, motion_s):
     if motion_e == 0 and motion_s == 0: return "Stationary"
     angle = math.degrees(math.atan2(-motion_s, motion_e))
     if angle < 0: angle += 360
-    dirs = ["East", "East-Northeast", "Northeast", "North-Northeast", "North", "North-Northwest", "Northwest", "West-Northwest", "West", "West-Southwest", "Southwest", "South-Southwest", "South", "South-Southeast", "Southeast","East-Southeast", "East"]
-    return dirs[int(round((angle / 360.0) * 16)) % 16] 
+    dirs = ["East", "East-Northeast", "Northeast", "North-Northeast", "North", "North-Northwest", "Northwest", "West-Northwest", "West", "West-Southwest", "Southwest", "South- Southwest", "South", "South-Southeast", "Southeast", "East-Southeast", "East"]
+    return dirs[int(round((angle / 360.0) * 16)) % 16]
 
 def haversine_distance(p1, p2):
     lon1, lat1, lon2, lat2 = p1.x, p1.y, p2.x, p2.y
@@ -58,7 +58,8 @@ def post_to_discord(payload, message_id=None, file_path=None):
     if file_path and os.path.exists(file_path):
         f = open(file_path, "rb")
         files = {"files[0]": ("radar.png", f, "image/png")}
-        payload["embeds"][0]["image"] = {"url": "attachment://radar.png"}
+        # The ProbSevere embed is always the last embed in the array
+        payload["embeds"][-1]["image"] = {"url": "attachment://radar.png"}
         payload["attachments"] = [{"id": 0, "filename": "radar.png"}]
 
     try:
@@ -66,7 +67,7 @@ def post_to_discord(payload, message_id=None, file_path=None):
             r = requests.patch(f"{WEBHOOK_URL}/messages/{message_id}", files=files, data={"payload_json": json.dumps(payload)})
             if r.status_code == 429:
                 time.sleep(float(r.headers.get("Retry-After", 1.0)))
-                if f: f.seek(0) # CRITICAL FIX: Rewinds file pointer after failed upload attempt
+                if f: f.seek(0)
                 requests.patch(f"{WEBHOOK_URL}/messages/{message_id}", files=files, data={"payload_json": json.dumps(payload)})
             return message_id
         else:
@@ -78,7 +79,7 @@ def post_to_discord(payload, message_id=None, file_path=None):
             return r.json().get("id")
     except: return None
     finally:
-        if f: f.close() # CRITICAL FIX: Closes file handle to prevent memory leaks
+        if f: f.close()
 
 def load_state():
     try:
@@ -186,12 +187,37 @@ def process_storms(data):
                     impact_text = f"Entering area in ~{eta_mins} minutes"
 
                 msg_id = state["alerted_storms"].get(storm_id, {}).get("message_id")
-                payload = {"content": f"<@&{ROLE_ID}>", "embeds": [build_discord_embed(props, impact_text, storm_id)]}
-                image_path = generate_radar_image(props, geom, "radar.png")
 
+                # Ensure we don't accidentally overwrite our Warnings Bot Piggyback Embeds!
+                payload = {"embeds": [build_discord_embed(props, impact_text, storm_id)]}
+
+                if msg_id:
+                    try:
+                        r = requests.get(f"{WEBHOOK_URL}/messages/{msg_id}")
+                        if r.status_code == 200:
+                            existing_msg = r.json()
+                            payload["content"] = existing_msg.get("content", f"<@&{ROLE_ID}>")
+                            warning_embeds = [e for e in existing_msg.get("embeds", []) if e.get("title", "").startswith("🚨 NWS")]
+                            payload["embeds"] = warning_embeds + payload["embeds"]
+                        else:
+                            payload["content"] = f"<@&{ROLE_ID}>"
+                    except:
+                        payload["content"] = f"<@&{ROLE_ID}>"
+                else:
+                    payload["content"] = f"<@&{ROLE_ID}>"
+
+                image_path = generate_radar_image(props, geom, "radar.png")
                 new_msg_id = post_to_discord(payload, message_id=msg_id, file_path=image_path)
+
                 if new_msg_id:
-                    state["alerted_storms"][storm_id] = {"timestamp": current_time, "message_id": new_msg_id, "eta_mins": eta_mins, "status": "active", "polygon": list(current_footprint.exterior.coords)}
+                    state["alerted_storms"][storm_id] = {
+                        "timestamp": current_time,
+                        "message_id": new_msg_id,
+                        "eta_mins": eta_mins,
+                        "status": "active",
+                        # We save the polygon here so warnings_bot.py can find it!
+                        "polygon": list(current_footprint.exterior.coords)
+                    }
 
     # --- RESOLUTION / STOP-TRACKING SYSTEM ---
     for storm_id, data in list(state["alerted_storms"].items()):
@@ -205,7 +231,6 @@ def process_storms(data):
                 motion_e, motion_s = safe_float(props.get("MOTION_EAST", 0)), safe_float(props.get("MOTION_SOUTH", 0))
                 prob_severe = int(props.get("ProbSevere", 0))
 
-                # If it's still generally severe but its cone missed the box, it deviated!
                 if prob_severe > 30:
                     dir_str = get_compass_dir(motion_e, motion_s)
                     resolve_text = f"**Storm ID:** `{storm_id}`\n\n✅ This storm is no longer on track to hit the area. It has deviated and is currently moving {dir_str}."
@@ -215,9 +240,9 @@ def process_storms(data):
                 resolve_text = f"**Storm ID:** `{storm_id}`\n\n✅ This storm no longer has a very high chance of being severe. Simply expect some rain and thunder at around {arrival_time}."
 
             payload = {
-                "content": "", # Remove ping so it doesn't bother users
+                "content": "",
                 "embeds": [{"title": f"STORM {storm_id} TRACKING CONCLUDED", "description": resolve_text, "color": 0x555555}],
-                "attachments": [] # Force Discord to physically delete the radar image to clean up the channel
+                "attachments": []
             }
             post_to_discord(payload, message_id=msg_id)
             state["alerted_storms"][storm_id]["status"] = "resolved"
@@ -232,10 +257,10 @@ def bot_loop():
         try:
             url = get_latest_probsevere_url()
             if url and url != last_processed_url:
-                data = fetch_probsevere(url)
+                data = fetch_probsevere(url)  # Ensure you define fetch_probsevere in your environment or use requests.get
                 if data:
-                    process_storms(data)
-                    last_processed_url = url
+            process_storms(data)
+            last_processed_url = url
             else: time.sleep(60)
         except Exception as e: print(f"Error in loop: {e}")
 
