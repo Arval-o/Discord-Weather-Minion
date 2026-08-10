@@ -259,8 +259,8 @@ def bot_loop():
             if url and url != last_processed_url:
                 data = fetch_probsevere(url)  # Ensure you define fetch_probsevere in your environment or use requests.get
                 if data:
-            process_storms(data)
-            last_processed_url = url
+                    process_storms(data)
+                    last_processed_url = url
             else: time.sleep(60)
         except Exception as e: print(f"Error in loop: {e}")
 
