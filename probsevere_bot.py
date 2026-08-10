@@ -13,7 +13,7 @@ from radar_generator import generate_radar_image
 # config
 BASE_URL = "https://mrms.ncep.noaa.gov/ProbSevere/PROBSEVERE/"
 STATE_FILE = "probsevere_state.json"
-WEBHOOK_URL = os.environ.get("PROBSEVERE_WEBHOOK_URL", "YOUR_DISCORD_WEBHOOK_URL_HERE")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "YOUR_DISCORD_WEBHOOK_URL_HERE")
 ROLE_ID = "1485401778962043021"
 
 HOME_LAT = 40.6035
